@@ -1,5 +1,6 @@
 services:
   attendance:
+    image: saigayathria48/student-attendance-management:latest
     build: .
     ports:
       - "${HOST_PORT:-3000}:3000"

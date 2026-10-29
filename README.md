@@ -8,6 +8,8 @@ Use Node.js 22.23.2 for local development. For containers, install Docker Deskto
 
 ## Run with Docker Compose
 
+The image is published to the private Docker Hub repository `saigayathria48/student-attendance-management`. Sign in with `docker login` before pulling it on another machine. The Compose file can also build the image locally.
+
 ```powershell
 docker compose build
 docker compose up -d
