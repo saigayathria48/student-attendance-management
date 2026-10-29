@@ -1,0 +1,20 @@
+node_modules/
+data/
+.env
+.env.*
+!.env.example
+coverage/
+evidence/private/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+test-results/t13/
+
+# Local execution artifacts and secrets
+test-results/
+evidence/
+secrets/
+*.log

@@ -1,0 +1,2 @@
+# Preserve T13 evidence byte-for-byte so its SHA-256 seal survives checkout.
+test-results/t13/** -text

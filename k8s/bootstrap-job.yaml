@@ -1,0 +1,46 @@
+# One-time bootstrap. Set image to the same immutable image used by the deployment.
+# Scale the deployment to zero first so this job has sole access to the PVC.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: attendance-bootstrap
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: bootstrap
+          image: attendance:local
+          imagePullPolicy: IfNotPresent
+          command: ["node", "scripts/seed.js"]
+          envFrom:
+            - configMapRef:
+                name: attendance-config
+          env:
+            - name: ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: attendance-bootstrap
+                  key: username
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: attendance-bootstrap
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: attendance-data

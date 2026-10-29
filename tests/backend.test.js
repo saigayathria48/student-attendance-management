@@ -1,0 +1,162 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { openDatabase } = require('../server/db');
+const { createApp } = require('../server/app');
+const { hashPassword } = require('../server/security');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const { report, today } = require('../server/app');
+
+test('API authorization, transactions, audit, calendar and calculations', async t => {
+  let commit = 'unknown';
+  try { commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(); } catch {}
+  t.diagnostic(`Environment: node ${process.version} ${process.platform}; commit ${commit}; started ${new Date().toISOString()}`);
+  const db=openDatabase(':memory:');
+  db.prepare('INSERT INTO users(username,password_hash,role) VALUES (?,?,?)').run('admin',hashPassword('test password 123'),'admin');
+  db.prepare('INSERT INTO users(username,password_hash,role) VALUES (?,?,?)').run('faculty',hashPassword('faculty password 123'),'faculty');
+  const app=createApp(db,{staticDir:false}), server=app.listen(0,'127.0.0.1');
+  await new Promise(r=>server.once('listening',r));
+  t.after(()=>{server.close();db.close();});
+  const base=`http://127.0.0.1:${server.address().port}`;
+  function client() { let cookie='',csrf=''; return async (route,method='GET',body) => { const response=await fetch(base+route,{method,headers:{...(cookie?{cookie}:{}),...(csrf?{'X-CSRF-Token':csrf}:{}),...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})}); const set=response.headers.get('set-cookie'); if(set) cookie=set.split(';')[0]; const data=route.includes('.csv')?await response.text():await response.json(); if(data.csrfToken) csrf=data.csrfToken; return {status:response.status,data}; }; }
+  const admin=client(), faculty=client(), guest=client();
+  assert.equal((await guest('/api/classes')).status,401);
+  assert.equal((await guest('/api/login','POST',{username:'admin',password:'test password 123'})).status,403);
+  // Case-variant API paths must not bypass the session/CSRF middleware.
+  assert.equal((await guest('/API/classes')).status,401);
+  assert.equal((await guest('/API/login','POST',{username:'admin',password:'test password 123'})).status,403);
+  await admin('/api/session'); assert.equal((await admin('/api/login','POST',{username:'admin',password:'test password 123'})).status,200);
+  await faculty('/api/session'); await faculty('/api/login','POST',{username:'faculty',password:'faculty password 123'});
+  const cls=(await admin('/api/classes','POST',{name:'Test'})).data.id;
+  // The browser allows 200-character names; the server must accept them.
+  const clsLong=(await admin('/api/classes','POST',{name:'Long names'})).data.id;
+  assert.equal((await admin('/api/students','POST',{classId:clsLong,roll:'L1',name:'x'.repeat(150),department:'y'.repeat(150),startDate:'2024-04-01'})).status,201);
+  assert.equal((await faculty(`/api/students?classId=${cls}`)).status,403);
+  assert.equal((await faculty('/api/classes','POST',{name:'No'})).status,403);
+  await admin('/api/assignments','POST',{userId:2,classId:cls});
+  const students=[];
+  for(let i=0;i<4;i++) { const r=await admin('/api/students','POST',{classId:cls,roll:`R${i}`,name:i===0?'=Formula':'Student '+i,department:'Test',startDate:'2024-04-01',endDate:'2024-04-30'}); assert.equal(r.status,201); students.push(r.data.id); }
+  const studentSnapshot=db.prepare('SELECT * FROM students ORDER BY id').all();
+  const enrollmentSnapshot=db.prepare('SELECT * FROM enrollments ORDER BY id').all();
+  assert.equal((await admin('/api/students','POST',{classId:cls,roll:'R0',name:'Duplicate',department:'Test',startDate:'2024-04-01'})).status,409);
+  assert.equal((await admin('/api/students','POST',{classId:cls,roll:'X',name:'',department:'Test',startDate:'2024-04-01'})).status,400);
+  assert.equal((await admin('/api/students','POST',{classId:cls,roll:'X',name:'Invalid Date',department:'Test',startDate:'2024-02-30'})).status,400);
+  assert.deepEqual(db.prepare('SELECT * FROM students ORDER BY id').all(),studentSnapshot);
+  assert.deepEqual(db.prepare('SELECT * FROM enrollments ORDER BY id').all(),enrollmentSnapshot);
+  let response=await faculty(`/api/attendance?classId=${cls}&date=2024-04-01`); assert.equal(response.data.students.length,4); assert.deepEqual(response.data.periods,[1,2,3,4,5,6,7]);
+  let save=await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:0,entries:[{studentId:students[0],period:1,status:'P'},{studentId:students[0],period:9,status:'A'}]}); assert.equal(save.status,400);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:0,entries:[null]})).status,400);
+  response=await faculty(`/api/attendance?classId=${cls}&date=2024-04-01`); assert.equal(response.data.version,0); assert.equal(response.data.students[0].statuses['1'],'U');
+  save=await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:0,entries:[{studentId:students[0],period:1,status:'P'}]}); assert.equal(save.status,200);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:0,entries:[]})).status,409);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:1,entries:[{studentId:students[0],period:1,status:'U'}]})).status,400);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version:1,reason:'Correction',entries:[{studentId:students[0],period:1,status:'U'}]})).status,200);
+  response=await faculty(`/api/audit?classId=${cls}&date=2024-04-01`); assert.equal(response.data.audit[0].previous,'P'); assert.equal(response.data.audit[0].value,'U'); assert.equal(response.data.audit[0].actor,'faculty');
+  assert.equal((await admin('/api/calendar','PUT',{date:'2024-04-01',periods:[2,3]})).status,409);
+  assert.equal((await admin('/api/students/'+students[0],'PUT',{classId:cls,roll:'R0',name:'=Formula',department:'Test',startDate:'2024-04-02',endDate:'2024-04-30'})).status,409);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'9999-01-01',version:0,entries:[]})).status,400);
+  // Populate 22 weekdays × 7 periods, including the already-cleared first cell.
+  const targets=[140,130,115,150], counts=[0,0,0,0];
+  for(let d=1;d<=30;d++) { const day=`2024-04-${String(d).padStart(2,'0')}`; const dow=new Date(day+'T00:00:00Z').getUTCDay(); if(dow===0||dow===6) continue; const entries=[]; for(let s=0;s<4;s++) for(let p=1;p<=7;p++) { entries.push({studentId:students[s],period:p,status:counts[s]++<targets[s]?'P':'A'}); } const result=await faculty('/api/attendance','PUT',{classId:cls,date:day,version:d===1?2:0,reason:'Fixture correction',entries}); assert.equal(result.status,200,JSON.stringify(result.data)); }
+  response=await faculty(`/api/reports?classId=${cls}&month=2024-04`);
+  assert.deepEqual(response.data.students.map(s=>s.working),[154,154,154,154]);
+  assert.deepEqual(response.data.students.map(s=>s.present),[140,130,115,150]);
+  assert.deepEqual(response.data.students.map(s=>s.absent),[14,24,39,4]);
+  assert.deepEqual(response.data.students.map(s=>s.unmarked),[0,0,0,0]);
+  assert.deepEqual(response.data.students.map(s=>s.percentage),[90.91,84.42,74.68,97.4]);
+  assert.ok(response.data.students.every(s=>s.complete));
+  assert.deepEqual(response.data.students.map(s=>s.low),[false,false,true,false]);
+  const classReport=response.data;
+  const individual=await faculty(`/api/reports?classId=${cls}&month=2024-04&studentId=${students[2]}`);
+  assert.equal(individual.status,200); assert.deepEqual(individual.data.students,[classReport.students[2]]);
+  assert.equal(individual.data.month,classReport.month); assert.equal(individual.data.threshold,classReport.threshold);
+  const classCsv=(await faculty(`/api/reports.csv?classId=${cls}&month=2024-04`)).data.trim().split('\r\n');
+  const individualCsv=await faculty(`/api/reports.csv?classId=${cls}&month=2024-04&studentId=${students[2]}`);
+  assert.equal(individualCsv.status,200); assert.deepEqual(individualCsv.data.trim().split('\r\n'),[classCsv[0],classCsv[3]]);
+  assert.equal((await faculty(`/api/reports?classId=${cls}&month=2024-05&studentId=${students[2]}`)).status,404);
+  assert.equal((await faculty(`/api/reports.csv?classId=${cls}&month=2024-04&studentId=99999`)).status,404);
+  const otherDateBefore=(await faculty(`/api/attendance?classId=${cls}&date=2024-04-02`)).data;
+  const firstDateBefore=(await faculty(`/api/attendance?classId=${cls}&date=2024-04-01`)).data;
+  const sameEntries=firstDateBefore.students.flatMap(s=>firstDateBefore.periods.map(period=>({studentId:s.id,period,status:s.statuses[String(period)]})));
+  const rowCount=db.prepare('SELECT COUNT(*) AS count FROM attendance WHERE class_id=?').get(cls).count;
+  assert.equal(rowCount,616);
+  for(let version=firstDateBefore.version;version<firstDateBefore.version+2;version++) assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-04-01',version,entries:sameEntries})).status,200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM attendance WHERE class_id=?').get(cls).count,rowCount);
+  assert.deepEqual((await faculty(`/api/attendance?classId=${cls}&date=2024-04-02`)).data,otherDateBefore);
+  assert.deepEqual((await faculty(`/api/attendance?classId=${cls}&date=2024-04-01`)).data.students,firstDateBefore.students);
+  const csv=await faculty(`/api/reports.csv?classId=${cls}&month=2024-04`); assert.match(csv.data,/'=Formula/); assert.match(csv.data,/"74.68"/);
+  response=await faculty(`/api/reports?classId=${cls}&month=2024-05`); assert.equal(response.data.students.length,0);
+  const partial=(await admin('/api/students','POST',{classId:cls,roll:'Partial',name:'Partial',department:'Test',startDate:'2024-05-01',endDate:'2024-05-02'})).data.id;
+  assert.equal((await admin('/api/calendar','PUT',{date:'2024-05-01',periods:[1,2,3,4]})).status,200);
+  assert.equal((await admin('/api/calendar','PUT',{date:'2024-05-02',periods:[]})).status,200);
+  const startDay=(await faculty(`/api/attendance?classId=${cls}&date=2024-05-01`)).data;
+  const endDay=(await faculty(`/api/attendance?classId=${cls}&date=2024-05-02`)).data;
+  assert.deepEqual(startDay.periods,[1,2,3,4]); assert.ok(startDay.students.some(s=>s.id===partial));
+  assert.deepEqual(endDay.periods,[]); assert.ok(endDay.students.some(s=>s.id===partial));
+  assert.ok(!(await faculty(`/api/attendance?classId=${cls}&date=2024-04-30`)).data.students.some(s=>s.id===partial));
+  assert.ok(!(await faculty(`/api/attendance?classId=${cls}&date=2024-05-03`)).data.students.some(s=>s.id===partial));
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-05-02',version:0,entries:[{studentId:partial,period:1,status:'P'}]})).status,400);
+  assert.equal((await faculty('/api/attendance','PUT',{classId:cls,date:'2024-05-03',version:0,entries:[{studentId:partial,period:1,status:'P'}]})).status,400);
+  await faculty('/api/attendance','PUT',{classId:cls,date:'2024-05-01',version:0,entries:[{studentId:partial,period:1,status:'P'},{studentId:partial,period:2,status:'P'},{studentId:partial,period:3,status:'P'}]});
+  response=await faculty(`/api/reports?classId=${cls}&month=2024-05`); assert.equal(response.data.students[0].percentage,75); assert.equal(response.data.students[0].complete,false); assert.equal(response.data.students[0].low,false);
+  await faculty('/api/attendance','PUT',{classId:cls,date:'2024-05-01',version:1,entries:[{studentId:partial,period:4,status:'A'}]});
+  response=await faculty(`/api/reports?classId=${cls}&month=2024-05`); assert.equal(response.data.students[0].working,4); assert.equal(response.data.students[0].percentage,75); assert.equal(response.data.students[0].complete,true); assert.equal(response.data.students[0].low,false);
+  await admin('/api/calendar','PUT',{date:'2024-06-01',periods:[]});
+  await admin('/api/students','POST',{classId:cls,roll:'Zero',name:'Zero',department:'Test',startDate:'2024-06-01',endDate:'2024-06-01'});
+  response=await faculty(`/api/reports?classId=${cls}&month=2024-06`); assert.equal(response.data.students[0].working,0); assert.equal(response.data.students[0].percentage,null); assert.equal(response.data.students[0].low,false);
+  const cls2=(await admin('/api/classes','POST',{name:'Transfer class'})).data.id;
+  const transfer=(await admin('/api/students','POST',{classId:cls,roll:'Transfer',name:'Transfer',department:'Test',startDate:'2024-07-01'})).data.id;
+  assert.equal((await admin('/api/attendance','PUT',{classId:cls,date:'2024-07-01',version:0,entries:[{studentId:transfer,period:1,status:'P'}]})).status,200);
+  assert.equal((await admin('/api/students/'+transfer,'PUT',{classId:cls2,roll:'T2',name:'Transfer',department:'Test',startDate:'2024-07-08'})).status,200);
+  assert.equal((await admin('/api/students/'+transfer,'PUT',{classId:cls,roll:'Transfer',name:'Transfer',department:'Test',startDate:'2024-07-15',endDate:'2024-07-19'})).status,200);
+  assert.equal((await admin('/api/students/'+transfer,'PUT',{classId:cls,roll:'Transfer',name:'Transfer Updated',department:'Test',startDate:'2024-07-15',endDate:'2024-07-19'})).status,200);
+  response=await admin(`/api/reports?classId=${cls}&month=2024-07`); assert.equal(response.data.students.length,1); assert.equal(response.data.students[0].working,70);
+  assert.equal(response.data.students[0].present,1);
+  response=await admin(`/api/students?classId=${cls}`); assert.equal(response.data.students.filter(s=>s.id===transfer).length,1);
+  assert.equal((await admin('/api/classes/'+cls,'PUT',{name:'Renamed'})).status,200);
+  response=await admin('/api/assignments'); assert.equal(response.data.assignments[0].className,'Renamed');
+  assert.equal((await admin('/api/assignments','DELETE',{userId:2,classId:cls})).status,200);
+  assert.equal((await faculty(`/api/reports?classId=${cls}&month=2024-04`)).status,403);
+  assert.equal((await admin('/api/users/1','PUT',{username:'admin',role:'admin',active:false})).status,409);
+  assert.equal((await admin('/api/users/2','PUT',{username:'faculty',role:'faculty',active:false})).status,200);
+  assert.equal((await faculty('/api/classes')).status,401);
+  await faculty('/api/session'); assert.equal((await faculty('/api/login','POST',{username:'faculty',password:'faculty password 123'})).status,401);
+  // Deactivation preserves saved attendance and report history.
+  const studentBefore=(await admin(`/api/reports?classId=${cls}&month=2024-04`)).data.students.find(s=>s.id===students[0]);
+  assert.equal((await admin('/api/students/'+students[0],'PUT',{classId:cls,roll:'R0',name:'=Formula',department:'Test',startDate:'2024-04-01',endDate:'2024-04-30',active:false})).status,200);
+  assert.equal((await admin(`/api/students?classId=${cls}`)).data.students.find(s=>s.id===students[0]).active,false);
+  assert.equal((await admin(`/api/attendance?classId=${cls}&date=2024-04-01`)).data.students.find(s=>s.id===students[0]).statuses['1'],'P');
+  assert.deepEqual((await admin(`/api/reports?classId=${cls}&month=2024-04`)).data.students.find(s=>s.id===students[0]),studentBefore);
+  // Repeated failures for the same client and username are throttled.
+  await guest('/api/session');
+  for (let i=0;i<10;i++) assert.equal((await guest('/api/login','POST',{username:'missing-user',password:'wrong password'})).status,401);
+  assert.equal((await guest('/api/login','POST',{username:'missing-user',password:'wrong password'})).status,429);
+});
+
+test('Kolkata midnight and inclusive month boundary eligibility', t => {
+  assert.equal(today(new Date('2024-03-31T18:29:59Z')),'2024-03-31');
+  assert.equal(today(new Date('2024-03-31T18:30:00Z')),'2024-04-01');
+  const db=openDatabase(':memory:'); t.after(()=>db.close());
+  db.prepare('INSERT INTO classes(name) VALUES (?)').run('Boundary');
+  db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Synthetic Boundary','Test');
+  db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (1,1,?,?,?)').run('B1','2024-03-31','2024-04-01');
+  db.prepare('INSERT INTO calendar(date,periods) VALUES (?,?)').run('2024-03-31','[1,2]');
+  const march=report(db,1,'2024-03').students[0], april=report(db,1,'2024-04').students[0];
+  assert.equal(march.working,2); assert.equal(march.unmarked,2);
+  assert.equal(april.working,7); assert.equal(april.unmarked,7);
+  assert.equal(report(db,1,'2024-02').students.length,0); assert.equal(report(db,1,'2024-05').students.length,0);
+});
+
+test('SQLite records and report survive a database reopen', t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'attendance-test-')); const file=path.join(dir,'test.sqlite');
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  let db=openDatabase(file);
+  db.prepare('INSERT INTO classes(name) VALUES (?)').run('Restart');
+  db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Synthetic','Test');
+  db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (1,1,?,?,?)').run('R1','2024-04-01','2024-04-01');
+  db.prepare('INSERT INTO attendance(student_id,class_id,date,period,status) VALUES (1,1,?,?,?)').run('2024-04-01',1,'P');
+  const before=report(db,1,'2024-04'); db.close();
+  db=openDatabase(file); assert.deepEqual(report(db,1,'2024-04'),before); assert.equal(before.students[0].present,1); assert.equal(before.students[0].unmarked,6); db.close();
+});

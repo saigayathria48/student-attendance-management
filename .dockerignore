@@ -1,0 +1,17 @@
+node_modules
+.git
+.env
+.env.*
+!.env.example
+data
+coverage
+playwright-report
+test-results
+evidence
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+
+secrets/
