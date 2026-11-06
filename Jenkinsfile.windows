@@ -13,13 +13,13 @@ pipeline {
     stages {
         stage('Install dependencies') {
             steps {
-                bat 'npm ci'
+                bat 'call "C:/Program Files/nodejs/npm.cmd" ci'
             }
         }
 
         stage('Run tests') {
             steps {
-                bat 'npm test'
+                bat 'call "C:/Program Files/nodejs/npm.cmd" test'
             }
         }
 
