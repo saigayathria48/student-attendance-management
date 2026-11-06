@@ -51,6 +51,8 @@ Selenium requires Chrome and a compatible ChromeDriver. `npm start` launches the
 
 `Jenkinsfile` describes a parameterized pipeline for an isolated Kubernetes test environment. Configure your own registry image, Jenkins credentials, test credentials, cluster context and namespace before running it. The manifests under `k8s/` require suitable persistent storage and a separately created bootstrap Secret. Prior runs are not evidence of a new deployment.
 
+For a local Windows Jenkins demonstration, use the `Jenkinsfile.windows` script as the Pipeline script path. It installs dependencies, runs `npm test`, builds a local Docker image, starts a temporary container on port 3011, checks `/health`, and removes the temporary container. It does not publish an image or change the application running on port 3000.
+
 ## Source provenance
 
 This publishable snapshot is based on the existing local project at commit `8d88af5d0999b260f6229bb7c642e24e04fe4bbe`. The original repository retains its complete history and attribution, including commits by Pranitha Bandiga and the recorded orchestrator identities. This snapshot excludes prior deployment reports and evidence; it does not claim that its tests or deployment have been freshly verified.

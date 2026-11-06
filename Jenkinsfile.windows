@@ -1,0 +1,65 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        IMAGE = "student-attendance-management:jenkins-${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Install dependencies') {
+            steps {
+                bat 'npm ci'
+            }
+        }
+
+        stage('Run tests') {
+            steps {
+                bat 'npm test'
+            }
+        }
+
+        stage('Build Docker image') {
+            steps {
+                bat '''
+                    set "DOCKER_EXE="
+                    if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                    if not defined DOCKER_EXE set "DOCKER_EXE=docker"
+                    "%DOCKER_EXE%" version
+                    "%DOCKER_EXE%" build -t "%IMAGE%" .
+                '''
+            }
+        }
+
+        stage('Docker health check') {
+            steps {
+                bat '''
+                    set "DOCKER_EXE="
+                    if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                    if not defined DOCKER_EXE set "DOCKER_EXE=docker"
+                    "%DOCKER_EXE%" rm -f attendance-jenkins-check >nul 2>&1
+                    "%DOCKER_EXE%" run -d --name attendance-jenkins-check -p 3011:3000 "%IMAGE%"
+                    powershell -NoProfile -ExecutionPolicy Bypass -Command "$deadline = (Get-Date).AddSeconds(30); do { try { $r = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3011/health' -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } } catch {}; Start-Sleep -Seconds 1 } while ((Get-Date) -lt $deadline); exit 1"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            bat '''
+                set "DOCKER_EXE="
+                if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                if not defined DOCKER_EXE set "DOCKER_EXE=docker"
+                "%DOCKER_EXE%" logs attendance-jenkins-check > docker-smoke.log 2>&1
+                "%DOCKER_EXE%" rm -f attendance-jenkins-check >nul 2>&1
+                exit /b 0
+            '''
+            archiveArtifacts artifacts: 'docker-smoke.log', allowEmptyArchive: true
+        }
+    }
+}
