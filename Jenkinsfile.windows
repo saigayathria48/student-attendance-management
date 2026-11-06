@@ -27,7 +27,7 @@ pipeline {
             steps {
                 bat '''
                     set "DOCKER_EXE="
-                    if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                    if exist "C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe" set "DOCKER_EXE=C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe"
                     if not defined DOCKER_EXE set "DOCKER_EXE=docker"
                     "%DOCKER_EXE%" version
                     "%DOCKER_EXE%" build -t "%IMAGE%" .
@@ -39,7 +39,7 @@ pipeline {
             steps {
                 bat '''
                     set "DOCKER_EXE="
-                    if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                    if exist "C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe" set "DOCKER_EXE=C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe"
                     if not defined DOCKER_EXE set "DOCKER_EXE=docker"
                     "%DOCKER_EXE%" rm -f attendance-jenkins-check >nul 2>&1
                     "%DOCKER_EXE%" run -d --name attendance-jenkins-check -p 3011:3000 "%IMAGE%"
@@ -53,7 +53,7 @@ pipeline {
         always {
             bat '''
                 set "DOCKER_EXE="
-                if exist "C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe" set "DOCKER_EXE=C:\Users\SaiGayathri\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe"
+                if exist "C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe" set "DOCKER_EXE=C:/Users/SaiGayathri/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe"
                 if not defined DOCKER_EXE set "DOCKER_EXE=docker"
                 "%DOCKER_EXE%" logs attendance-jenkins-check > docker-smoke.log 2>&1
                 "%DOCKER_EXE%" rm -f attendance-jenkins-check >nul 2>&1
