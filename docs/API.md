@@ -13,3 +13,12 @@ All API bodies and responses are JSON except CSV; dates are YYYY-MM-DD local Asi
 Enrollment is inclusive; no overlapping memberships; roll unique in class. Reports use full calendar month intersected with membership, even future dates. Working = P+A+U; strict unrounded threshold, rounded presentation, no definite low for incomplete/zero. Server rejects future attendance and ineligible period/enrollment. Saved marks remain if student deactivated; calendar/enrollment changes cannot invalidate marks. Account, enrollment and audit API details may be extended compatibly; document updates in docs/API.md.
 
 Administrative account API: GET /api/users returns {users:[{id,username,role,active}]}; POST /api/users takes {username,password,role}; PUT /api/users/:id takes {username,role,active,password?}. PUT /api/classes/:id takes {name}. GET /api/assignments returns {assignments:[{userId,classId,username,className}]}; POST and DELETE /api/assignments take {userId,classId}. PUT student includes active and enrollment dates; transfer closes the previous enrollment on the day before its new effective date. Session token is also required for login. See backend-notes.md for additional details.
+
+## Internal marks and performance
+
+All endpoints require authentication and class access; faculty are limited to assigned classes. Mutations require the session CSRF token.
+
+- GET /api/subjects?classId= lists class subjects; POST /api/subjects takes {classId,name}.
+- GET /api/assessments?classId= lists dated assessments; POST /api/assessments takes {classId,subjectId,name,date,maxMarks}. A subject must belong to the selected class.
+- GET /api/marks?classId=&assessmentId= returns the assessment, version and students enrolled on its date, with null for an unentered mark. PUT /api/marks takes {classId,assessmentId,version,entries:[{studentId,marks}]}. Marks are null or a number between zero and the assessment maximum. Writes are atomic; stale versions receive 409.
+- GET /api/performance?classId=&month= returns the attendance report with each student's eligible assessments dated in that month and their marks, including null for marks not entered. Attendance completeness and threshold rules are unchanged. No aggregate grades or weighting are assumed.

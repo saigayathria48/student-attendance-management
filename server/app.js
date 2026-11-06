@@ -95,6 +95,7 @@ function createApp(db, opts = {}) {
     db.prepare('UPDATE students SET name=?,department=?,active=? WHERE id=?').run(x.name,x.department,x.active?1:0,studentId);
     if(target) db.prepare('UPDATE enrollments SET roll=?,start_date=?,end_date=? WHERE id=?').run(x.roll,x.startDate,x.endDate,target.id); else db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (?,?,?,?,?)').run(studentId,x.classId,x.roll,x.startDate,x.endDate);
     if(db.prepare('SELECT 1 FROM attendance a WHERE a.student_id=? AND NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.student_id=a.student_id AND e.class_id=a.class_id AND e.start_date<=a.date AND (e.end_date IS NULL OR e.end_date>=a.date)) LIMIT 1').get(studentId)) fail('Enrollment change would invalidate recorded attendance',409);
+    if(db.prepare('SELECT 1 FROM academic_marks m JOIN assessments a ON a.id=m.assessment_id JOIN subjects s ON s.id=a.subject_id WHERE m.student_id=? AND NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.student_id=m.student_id AND e.class_id=s.class_id AND e.start_date<=a.date AND (e.end_date IS NULL OR e.end_date>=a.date)) LIMIT 1').get(studentId)) fail('Enrollment change would invalidate recorded marks',409);
   }); res.json({ok:true}); });
   function daily(classId, day) {
     const periods=periodList(db,day), version=db.prepare('SELECT version FROM attendance_versions WHERE class_id=? AND date=?').get(classId,day)?.version || 0;
@@ -130,6 +131,79 @@ function createApp(db, opts = {}) {
   app.put('/api/settings',auth,admin,(req,res)=>{ const n=req.body.threshold; if(typeof n!=='number'||!Number.isFinite(n)||n<0||n>100) fail('Threshold must be a number from 0 to 100'); db.prepare("UPDATE settings SET value=? WHERE key='threshold'").run(String(n)); res.json({ok:true}); });
   app.put('/api/calendar',auth,admin,(req,res)=>{ const day=date(req.body.date), periods=req.body.periods; if(!Array.isArray(periods)||periods.some(p=>!Number.isInteger(p)||p<1||p>7)||new Set(periods).size!==periods.length) fail('Periods must be unique numbers from 1 to 7'); transaction(db,()=>{ const recorded=db.prepare('SELECT DISTINCT period FROM attendance WHERE date=?').all(day); if(recorded.some(r=>!periods.includes(r.period))) fail('Calendar change would invalidate recorded attendance',409); db.prepare('INSERT INTO calendar(date,periods) VALUES (?,?) ON CONFLICT(date) DO UPDATE SET periods=excluded.periods').run(day,JSON.stringify([...periods].sort((a,b)=>a-b))); }); res.json({ok:true}); });
   app.get(['/api/reports','/api/reports.csv'],auth,(req,res)=>{ const classId=id(req.query.classId,'Class ID'); access(req,classId); const data=report(db,classId,req.query.month); if(req.query.studentId!==undefined) { const studentId=id(req.query.studentId,'Student ID'); data.students=data.students.filter(s=>s.id===studentId); if(!data.students.length) fail('Student has no enrollment in this class and month',404); } if(req.path.endsWith('.csv')) { const header=['id','roll','name','working','present','absent','unmarked','percentage','complete','low']; const rows=[header,...data.students.map(s=>header.map(k=>s[k]===null?'N/A':k==='percentage'?s[k].toFixed(2):s[k]))]; res.set('Content-Type','text/csv; charset=utf-8').set('Content-Disposition',`attachment; filename="attendance-${data.month}.csv"`).send(rows.map(r=>r.map(csvCell).join(',')).join('\r\n')+'\r\n'); } else res.json(data); });
+  // Subjects and dated assessments belong to a class. Class assignments control
+  // every read and write, just as they do for attendance.
+  app.get('/api/subjects',auth,(req,res)=>{
+    const classId=id(req.query.classId,'Class ID'); access(req,classId);
+    res.json({subjects:db.prepare('SELECT id,name FROM subjects WHERE class_id=? ORDER BY name').all(classId)});
+  });
+  app.post('/api/subjects',auth,(req,res)=>{
+    const classId=id(req.body.classId,'Class ID'); access(req,classId);
+    const r=db.prepare('INSERT INTO subjects(class_id,name) VALUES (?,?)').run(classId,text(req.body.name,'Subject name'));
+    res.status(201).json({id:Number(r.lastInsertRowid)});
+  });
+  const assessmentQuery=`SELECT a.id,a.subject_id AS subjectId,s.name AS subjectName,a.name,a.max_marks AS maxMarks,a.date,a.version FROM assessments a JOIN subjects s ON s.id=a.subject_id`;
+  function assessmentFor(classId,assessmentId) {
+    const assessment=db.prepare(`${assessmentQuery} WHERE a.id=? AND s.class_id=?`).get(assessmentId,classId);
+    if(!assessment) fail('Assessment not found in this class',404);
+    return assessment;
+  }
+  app.get('/api/assessments',auth,(req,res)=>{
+    const classId=id(req.query.classId,'Class ID'); access(req,classId);
+    const assessments=db.prepare(`${assessmentQuery} WHERE s.class_id=? ORDER BY a.date DESC,s.name,a.name`).all(classId).map(({version,...rest})=>rest);
+    res.json({assessments});
+  });
+  app.post('/api/assessments',auth,(req,res)=>{
+    const classId=id(req.body.classId,'Class ID'), subjectId=id(req.body.subjectId,'Subject ID'); access(req,classId);
+    if(!db.prepare('SELECT 1 FROM subjects WHERE id=? AND class_id=?').get(subjectId,classId)) fail('Subject not found in this class',404);
+    const maxMarks=req.body.maxMarks;
+    if(typeof maxMarks!=='number'||!Number.isFinite(maxMarks)||maxMarks<=0||maxMarks>10000) fail('Maximum marks must be greater than 0 and at most 10000');
+    const result=db.prepare('INSERT INTO assessments(subject_id,name,date,max_marks) VALUES (?,?,?,?)').run(subjectId,text(req.body.name,'Assessment name'),date(req.body.date,'Assessment date'),maxMarks);
+    res.status(201).json({id:Number(result.lastInsertRowid)});
+  });
+  app.get('/api/marks',auth,(req,res)=>{
+    const classId=id(req.query.classId,'Class ID'),assessmentId=id(req.query.assessmentId,'Assessment ID'); access(req,classId);
+    const {version,...assessment}=assessmentFor(classId,assessmentId);
+    const marks=new Map(db.prepare('SELECT student_id,marks FROM academic_marks WHERE assessment_id=?').all(assessmentId).map(m=>[m.student_id,m.marks]));
+    const students=enrollments(db,classId).filter(s=>s.startDate<=assessment.date && (!s.endDate || s.endDate>=assessment.date)).map(s=>({id:s.id,roll:s.roll,name:s.name,marks:marks.has(s.id)?marks.get(s.id):null}));
+    res.json({assessment,version,students});
+  });
+  app.put('/api/marks',auth,(req,res)=>{
+    const classId=id(req.body.classId,'Class ID'),assessmentId=id(req.body.assessmentId,'Assessment ID'); access(req,classId);
+    const version=req.body.version,entries=req.body.entries;
+    if(!Number.isSafeInteger(version)||version<0) fail('Version must be a nonnegative integer');
+    if(!Array.isArray(entries)||entries.length>10000) fail('Entries must be an array of at most 10000 marks');
+    const next=transaction(db,()=>{
+      const assessment=assessmentFor(classId,assessmentId);
+      if(assessment.version!==version) fail('Marks changed since they were loaded. Review and reload before saving.',409,'STALE_VERSION');
+      const eligible=db.prepare('SELECT 1 FROM enrollments WHERE student_id=? AND class_id=? AND start_date<=? AND (end_date IS NULL OR end_date>=?)');
+      const seen=new Set(),changes=[];
+      for(const entry of entries) {
+        if(!entry||typeof entry!=='object'||Array.isArray(entry)) fail('Each entry must be an object');
+        const studentId=id(entry.studentId,'Student ID');
+        if(seen.has(studentId)) fail('Duplicate student entry'); seen.add(studentId);
+        if(!eligible.get(studentId,classId,assessment.date,assessment.date)) fail('Student is not enrolled in this class on the assessment date');
+        if(entry.marks!==null && (typeof entry.marks!=='number'||!Number.isFinite(entry.marks)||entry.marks<0||entry.marks>assessment.maxMarks)) fail('Marks must be blank or between 0 and the maximum');
+        changes.push({studentId,marks:entry.marks});
+      }
+      const upsert=db.prepare('INSERT INTO academic_marks(assessment_id,student_id,marks) VALUES (?,?,?) ON CONFLICT(assessment_id,student_id) DO UPDATE SET marks=excluded.marks');
+      const remove=db.prepare('DELETE FROM academic_marks WHERE assessment_id=? AND student_id=?');
+      for(const entry of changes) { if(entry.marks===null) remove.run(assessmentId,entry.studentId); else upsert.run(assessmentId,entry.studentId,entry.marks); }
+      db.prepare('UPDATE assessments SET version=version+1 WHERE id=?').run(assessmentId);
+      return version+1;
+    });
+    res.json({ok:true,version:next});
+  });
+  app.get('/api/performance',auth,(req,res)=>{
+    const classId=id(req.query.classId,'Class ID'); access(req,classId);
+    const data=report(db,classId,req.query.month),days=monthDates(req.query.month);
+    const assessments=db.prepare(`${assessmentQuery} WHERE s.class_id=? AND a.date>=? AND a.date<=? ORDER BY a.date,s.name,a.name`).all(classId,days[0],days.at(-1));
+    const rows=db.prepare('SELECT m.assessment_id,m.student_id,m.marks FROM academic_marks m JOIN assessments a ON a.id=m.assessment_id JOIN subjects s ON s.id=a.subject_id WHERE s.class_id=? AND a.date>=? AND a.date<=?').all(classId,days[0],days.at(-1));
+    const saved=new Map(rows.map(r=>[`${r.assessment_id}:${r.student_id}`,r.marks]));
+    const member=db.prepare('SELECT 1 FROM enrollments WHERE student_id=? AND class_id=? AND start_date<=? AND (end_date IS NULL OR end_date>=?)');
+    for(const student of data.students) student.marks=assessments.filter(a=>member.get(student.id,classId,a.date,a.date)).map(a=>({assessmentId:a.id,subjectName:a.subjectName,assessmentName:a.name,date:a.date,maxMarks:a.maxMarks,marks:saved.has(`${a.id}:${student.id}`)?saved.get(`${a.id}:${student.id}`):null}));
+    res.json(data);
+  });
   if (opts.staticDir !== false) app.use(express.static(opts.staticDir || path.join(__dirname,'..','public')));
   app.use((err,req,res,next)=>{ if(res.headersSent) return next(err); const triggerAbort=err.errcode===1811 || /already used in this class|overlaps another interval|constraint failed/i.test(String(err.message||'')); if((err.code && String(err.code).startsWith('SQLITE_CONSTRAINT')) || (err.code==='ERR_SQLITE_ERROR' && triggerAbort)) return res.status(409).json({error:'A record with these unique values already exists or a reference is invalid',code:'CONSTRAINT'}); if(err.status) return res.status(err.status).json({error:err.message,...(err.code?{code:err.code}:{})}); if(err instanceof SyntaxError && err.status===400) return res.status(400).json({error:'Invalid JSON'}); console.error('Request failed:',err.message); res.status(500).json({error:'Internal server error'}); });
   return app;

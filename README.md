@@ -1,6 +1,12 @@
 # Student Attendance Management System
 
-A single-instance attendance application with an Express API, a vanilla JavaScript interface and a persistent SQLite database. It supports administrator and faculty accounts, class and student management, attendance entry and monthly reports. The Docker configuration runs the application as a non-root user and stores its database in a named volume.
+A single-instance attendance and academic performance application with an Express API, a vanilla JavaScript interface and a persistent SQLite database. It supports administrator and faculty accounts, class and student management, attendance entry, internal assessment marks and monthly performance reports. The Docker configuration runs the application as a non-root user and stores its database in a named volume.
+
+## Internal marks and performance reports
+
+An administrator creates classes and students, creates faculty accounts and assigns faculty to classes. An administrator or assigned faculty member can open **Internal marks**, select a class, add subjects and dated assessments, and enter each eligible student's marks. Marks can be blank or between zero and the assessment maximum; a blank is not treated as zero. The assessment date determines which students were enrolled. Reload the register before saving if another user changed it.
+
+Open **Performance report**, choose a class and month, and select **View performance** to see attendance and marks for assessments dated in that month. Attendance follows the existing [attendance policy](docs/attendance-policy.md), including preliminary reports for unmarked periods. The report lists each assessment separately and does not assume grade boundaries or weighting.
 
 ## Prerequisites
 

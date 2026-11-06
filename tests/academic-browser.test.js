@@ -1,0 +1,104 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { Builder, By, until } = require('selenium-webdriver');
+const edge = require('selenium-webdriver/edge');
+const { openDatabase } = require('../server/db');
+const { createApp } = require('../server/app');
+const { hashPassword } = require('../server/security');
+
+// Always uses a temporary local database and an ephemeral loopback port.
+test('faculty enters marks and views a persistent combined report', { timeout: 120000 }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'academic-browser-'));
+  const dbFile = path.join(dir, 'test.sqlite');
+  const username = 'faculty-browser';
+  const password = crypto.randomBytes(24).toString('base64url');
+  let db, server, driver;
+  t.after(async () => {
+    if (driver) await driver.quit();
+    if (server) await new Promise(resolve => server.close(resolve));
+    if (db) db.close();
+    if (path.dirname(dir) === path.resolve(os.tmpdir()) && path.basename(dir).startsWith('academic-browser-')) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  db = openDatabase(dbFile);
+  const facultyId = Number(db.prepare('INSERT INTO users(username,password_hash,role) VALUES (?,?,?)').run(username, hashPassword(password), 'faculty').lastInsertRowid);
+  const classId = Number(db.prepare('INSERT INTO classes(name) VALUES (?)').run('Browser Class').lastInsertRowid);
+  db.prepare('INSERT INTO assignments(user_id,class_id) VALUES (?,?)').run(facultyId, classId);
+  const studentId = Number(db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Synthetic Student', 'Testing').lastInsertRowid);
+  const secondId = Number(db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Second Student', 'Testing').lastInsertRowid);
+  const enrollment = db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (?,?,?,?,?)');
+  enrollment.run(studentId, classId, 'S001', '2024-04-01', '2024-04-01');
+  enrollment.run(secondId, classId, 'S002', '2024-04-01', '2024-04-01');
+  const attendance = db.prepare('INSERT INTO attendance(student_id,class_id,date,period,status) VALUES (?,?,?,?,?)');
+  for (let period = 1; period <= 7; period++) attendance.run(studentId, classId, '2024-04-01', period, 'P');
+  async function startServer() {
+    server = createApp(db).listen(0, '127.0.0.1');
+    await new Promise(resolve => server.once('listening', resolve));
+    return `http://127.0.0.1:${server.address().port}`;
+  }
+  let base = await startServer();
+  const options = new edge.Options().addArguments('--headless=new', '--disable-gpu', '--no-sandbox', '--window-size=1440,1000');
+  driver = await new Builder().forBrowser('MicrosoftEdge').setEdgeOptions(options).build();
+  const find = css => driver.findElement(By.css(css));
+  const click = async css => (await find(css)).click();
+  const type = async (css, value) => { const element = await find(css); await element.clear(); await element.sendKeys(value); };
+  const setValue = async (css, value) => driver.executeScript('arguments[0].value=arguments[1]; arguments[0].dispatchEvent(new Event("change", {bubbles:true}));', await find(css), String(value));
+  const submit = async css => (await find(css)).submit();
+  const waitText = async (css, value) => driver.wait(async () => (await (await find(css)).getText()).includes(value), 10000, `Waiting for ${css}: ${value}`);
+  async function login() {
+    await driver.get(base);
+    await driver.wait(until.elementLocated(By.css('#login-form input[name=username]')), 10000);
+    await type('#login-form input[name=username]', username);
+    await type('#login-form input[name=password]', password);
+    await submit('#login-form');
+    await driver.wait(async () => (await find('#app')).isDisplayed(), 10000, 'Faculty sign in failed');
+  }
+  await login();
+  await click('[data-view=marks]');
+  await setValue('#marks-class-filter select[name=classId]', classId);
+  await submit('#marks-class-filter');
+  await waitText('#marks-class-heading', 'Browser Class');
+  await type('#subject-form input[name=name]', 'Mathematics');
+  await submit('#subject-form');
+  await waitText('#notice', 'Subject added.');
+  const subjectId = await driver.executeScript('return [...document.querySelectorAll("#assessment-form select[name=subjectId] option")].find(o => o.textContent === "Mathematics").value');
+  await setValue('#assessment-form select[name=subjectId]', subjectId);
+  await type('#assessment-form input[name=name]', 'Internal Test 1');
+  await type('#assessment-form input[name=maxMarks]', '20');
+  await setValue('#assessment-form input[name=date]', '2024-04-01');
+  await submit('#assessment-form');
+  await waitText('#notice', 'Assessment added.');
+  const assessmentId = await driver.executeScript('return [...document.querySelectorAll("#marks-filter select[name=assessmentId] option")].find(o => o.textContent.includes("Internal Test 1")).value');
+  await setValue('#marks-filter select[name=assessmentId]', assessmentId);
+  await submit('#marks-filter');
+  await waitText('#marks-state', 'Marks loaded.');
+  const first = `#marks-rows input[data-student-id="${studentId}"]`;
+  await type(first, '18');
+  await submit('#marks-save');
+  await waitText('#marks-state', 'Marks saved and reloaded.');
+  assert.equal(await (await find(first)).getAttribute('value'), '18');
+  assert.equal(await (await find(`#marks-rows input[data-student-id="${secondId}"]`)).getAttribute('value'), '');
+  await click('[data-view=performance]');
+  await setValue('#performance-filter select[name=classId]', classId);
+  await setValue('#performance-filter input[name=month]', '2024-04');
+  await submit('#performance-filter');
+  await waitText('#performance-heading', '2024-04');
+  const report = await (await find('#performance-rows')).getText();
+  assert.match(report, /Synthetic Student.*100\.00%.*Mathematics.*Internal Test 1.*18 \/ 20/s);
+  assert.match(report, /Second Student.*Not entered/s);
+  await new Promise(resolve => server.close(resolve));
+  server = null; db.close(); db = openDatabase(dbFile); base = await startServer();
+  await login();
+  await click('[data-view=performance]');
+  await setValue('#performance-filter select[name=classId]', classId);
+  await setValue('#performance-filter input[name=month]', '2024-04');
+  await submit('#performance-filter');
+  await waitText('#performance-heading', '2024-04');
+  assert.match(await (await find('#performance-rows')).getText(), /Synthetic Student.*100\.00%.*Internal Test 1.*18 \/ 20/s);
+  t.diagnostic('Faculty created a subject and assessment, saved marks, viewed attendance and marks, and reloaded the report after reopening the database.');
+});

@@ -1,10 +1,10 @@
 'use strict';
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-const state = { csrf: '', user: null, classes: [], users: [], register: null, dirty: false, reportQuery: null };
+const state = { csrf: '', user: null, classes: [], users: [], register: null, dirty: false, reportQuery: null, marksClassId: null, marksRegister: null, marksDirty: false };
 const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 $$('input[type=date]').forEach(input => { if (input.name === 'date' || input.name === 'startDate') input.value = localDate; });
-$('input[type=month]').value = localDate.slice(0, 7);
+$$('input[type=month]').forEach(input => { input.value = localDate.slice(0, 7); });
 
 function notice(message, error = false) {
   const box = $('#notice'); box.hidden = !message; box.textContent = message; box.classList.toggle('error', error);
@@ -92,8 +92,8 @@ run($('#login-form'), async data => {
   $('#login-form').reset(); await session(); notice('Signed in successfully.');
 });
 $('#logout').addEventListener('click', async () => {
-  if (state.dirty && !window.confirm('You have unsaved attendance changes. Sign out and discard them?')) return;
-  try { await request('/api/logout', { method: 'POST' }); state.register = null; state.dirty = false; $('#attendance-content').hidden = true; await session(); notice('Signed out.'); }
+  if ((state.dirty || state.marksDirty) && !window.confirm('You have unsaved attendance or marks changes. Sign out and discard them?')) return;
+  try { await request('/api/logout', { method: 'POST' }); state.register = null; state.dirty = false; state.marksRegister = null; state.marksDirty = false; state.marksClassId = null; $('#attendance-content').hidden = true; $('#marks-class-content').hidden = true; $('#marks-content').hidden = true; $('#performance-content').hidden = true; await session(); notice('Signed out.'); }
   catch (error) { notice(error.message, true); }
 });
 $('#navigation').addEventListener('click', event => {
@@ -218,5 +218,105 @@ run($('#user-form'), async data => {
 run($('#assignment-form'), async data => { await request('/api/assignments', { method: 'POST', body: { userId: Number(data.get('userId')), classId: Number(data.get('classId')) } }); await refreshAssignments(); notice('Faculty assignment saved.'); });
 run($('#threshold-form'), async data => { await request('/api/settings', { method: 'PUT', body: { threshold: Number(data.get('threshold')) } }); await refreshSettings(); notice('Threshold saved.'); });
 run($('#calendar-form'), async data => { await request('/api/calendar', { method: 'PUT', body: { date: data.get('date'), periods: data.getAll('period').map(Number) } }); await refreshSettings(); notice('Calendar exception saved.'); });
-window.addEventListener('beforeunload', event => { if (state.dirty) { event.preventDefault(); event.returnValue = ''; } });
+
+async function refreshAcademicOptions(classId) {
+  const [subjectResult, assessmentResult] = await Promise.all([
+    request(`/api/subjects?${query({ classId })}`),
+    request(`/api/assessments?${query({ classId })}`),
+  ]);
+  const subjectSelect = $('#assessment-form').elements.subjectId;
+  const selectedSubject = subjectSelect.value;
+  const subjectList = $('#subject-list'); subjectList.replaceChildren();
+  subjectSelect.replaceChildren(option('', 'Select a subject'));
+  subjectResult.subjects.forEach(subject => {
+    listItem(subjectList, subject.name);
+    subjectSelect.append(option(subject.id, subject.name));
+  });
+  if (!subjectResult.subjects.length) listItem(subjectList, 'No subjects yet. Add a subject to create an assessment.');
+  if (subjectResult.subjects.some(subject => String(subject.id) === selectedSubject)) subjectSelect.value = selectedSubject;
+  const assessmentSelect = $('#marks-filter').elements.assessmentId;
+  const selectedAssessment = assessmentSelect.value;
+  assessmentSelect.replaceChildren(option('', 'Select an assessment'));
+  assessmentResult.assessments.forEach(item => assessmentSelect.append(option(item.id, `${item.subjectName} · ${item.name} · ${item.date} · out of ${item.maxMarks}`)));
+  if (assessmentResult.assessments.some(item => String(item.id) === selectedAssessment)) assessmentSelect.value = selectedAssessment;
+}
+run($('#marks-class-filter'), async data => {
+  if (state.marksDirty && !window.confirm('You have unsaved marks. Discard them and load another class?')) return;
+  const classId = Number(data.get('classId'));
+  await refreshAcademicOptions(classId);
+  state.marksClassId = classId; state.marksRegister = null; state.marksDirty = false;
+  $('#marks-content').hidden = true; $('#marks-class-content').hidden = false;
+  $('#marks-class-heading').textContent = className(classId);
+  $('#subject-form').reset(); $('#assessment-form').reset(); $('#assessment-form').elements.date.value = localDate;
+});
+run($('#subject-form'), async data => {
+  if (!state.marksClassId) return;
+  await request('/api/subjects', { method: 'POST', body: { classId: state.marksClassId, name: data.get('name').trim() } });
+  $('#subject-form').reset(); await refreshAcademicOptions(state.marksClassId); notice('Subject added.');
+});
+run($('#assessment-form'), async data => {
+  if (!state.marksClassId) return;
+  await request('/api/assessments', { method: 'POST', body: { classId: state.marksClassId, subjectId: Number(data.get('subjectId')), name: data.get('name').trim(), maxMarks: Number(data.get('maxMarks')), date: data.get('date') } });
+  $('#assessment-form').reset(); $('#assessment-form').elements.date.value = localDate;
+  await refreshAcademicOptions(state.marksClassId); notice('Assessment added. Select it below to enter marks.');
+});
+function renderMarks(result, classId) {
+  state.marksRegister = { ...result, classId }; state.marksDirty = false;
+  $('#marks-content').hidden = false;
+  $('#marks-heading').textContent = `${result.assessment.subjectName} · ${result.assessment.name} · ${result.assessment.date} · out of ${result.assessment.maxMarks}`;
+  const rows = $('#marks-rows'); rows.replaceChildren();
+  result.students.forEach(student => {
+    const tr = document.createElement('tr'); cell(tr, student.roll); cell(tr, student.name);
+    const td = document.createElement('td'); const input = document.createElement('input');
+    input.type = 'number'; input.min = '0'; input.max = String(result.assessment.maxMarks); input.step = 'any';
+    input.dataset.studentId = student.id; input.value = student.marks === null ? '' : String(student.marks);
+    input.setAttribute('aria-label', `Marks for ${student.name}, maximum ${result.assessment.maxMarks}`);
+    input.addEventListener('input', () => { state.marksDirty = true; $('#marks-state').textContent = 'Unsaved marks.'; });
+    td.append(input); tr.append(td); rows.append(tr);
+  });
+  if (!result.students.length) { const tr = document.createElement('tr'); const td = cell(tr, 'No students were enrolled in this class on the assessment date.'); td.colSpan = 3; rows.append(tr); }
+  $('#marks-state').textContent = 'Marks loaded.';
+}
+async function loadMarks(assessmentId, classId, confirmDiscard = true) {
+  if (confirmDiscard && state.marksDirty && !window.confirm('You have unsaved marks. Discard them and load saved marks?')) return;
+  const result = await request(`/api/marks?${query({ classId, assessmentId })}`);
+  renderMarks(result, classId);
+}
+run($('#marks-filter'), async data => { await loadMarks(data.get('assessmentId'), state.marksClassId); });
+$('#marks-reload').addEventListener('click', async () => {
+  if (!state.marksRegister) return;
+  try { await loadMarks(state.marksRegister.assessment.id, state.marksRegister.classId); } catch (error) { notice(error.message, true); }
+});
+run($('#marks-save'), async () => {
+  if (!state.marksRegister) return;
+  const register = state.marksRegister;
+  const entries = $$('#marks-rows input').map(input => ({ studentId: Number(input.dataset.studentId), marks: input.value === '' ? null : Number(input.value) }));
+  try {
+    await request('/api/marks', { method: 'PUT', body: { classId: register.classId, assessmentId: register.assessment.id, version: register.version, entries } });
+    state.marksDirty = false;
+    await loadMarks(register.assessment.id, register.classId, false);
+    $('#marks-state').textContent = 'Marks saved and reloaded.';
+  } catch (error) {
+    if (error.status === 409) { state.marksDirty = true; $('#marks-state').textContent = 'Marks changed elsewhere. Your entries are preserved; review them before reloading.'; }
+    throw error;
+  }
+});
+run($('#performance-filter'), async data => {
+  const classId = data.get('classId'); const month = data.get('month');
+  const result = await request(`/api/performance?${query({ classId, month })}`);
+  $('#performance-heading').textContent = `${className(classId)} · ${result.month}`;
+  const rows = $('#performance-rows'); rows.replaceChildren();
+  result.students.forEach(student => {
+    const tr = document.createElement('tr'); cell(tr, student.roll); cell(tr, student.name);
+    cell(tr, student.percentage === null ? 'N/A' : `${Number(student.percentage).toFixed(2)}%`);
+    cell(tr, student.working === 0 ? 'No eligible periods' : !student.complete ? 'Preliminary · incomplete' : student.low ? 'Low attendance' : 'Complete', !student.complete ? 'status-preliminary' : student.low ? 'status-low' : '');
+    const td = document.createElement('td');
+    if (!student.marks.length) td.textContent = 'No assessments for this month.';
+    else { const list = document.createElement('ul'); list.className = 'marks-list'; student.marks.forEach(mark => listItem(list, `${mark.subjectName} · ${mark.assessmentName} (${mark.date}): ${mark.marks === null ? 'Not entered' : `${mark.marks} / ${mark.maxMarks}`}`)); td.append(list); }
+    tr.append(td); rows.append(tr);
+  });
+  if (!result.students.length) { const tr = document.createElement('tr'); const td = cell(tr, 'No students found for this month.'); td.colSpan = 5; rows.append(tr); }
+  $('#performance-content').hidden = false;
+});
+window.addEventListener('beforeunload', event => { if (state.dirty || state.marksDirty) { event.preventDefault(); event.returnValue = ''; } });
 session().catch(error => notice(error.message, true));

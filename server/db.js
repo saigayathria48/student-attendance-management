@@ -21,7 +21,11 @@ function openDatabase(file = process.env.DB_PATH || path.join(process.cwd(), 'da
     CREATE UNIQUE INDEX IF NOT EXISTS attendance_one_class ON attendance(student_id,date,period);
     CREATE TABLE IF NOT EXISTS attendance_versions (class_id INTEGER NOT NULL REFERENCES classes(id), date TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(class_id,date));
     CREATE TABLE IF NOT EXISTS attendance_audit (id INTEGER PRIMARY KEY, student_id INTEGER NOT NULL, class_id INTEGER NOT NULL, date TEXT NOT NULL, period INTEGER NOT NULL, previous TEXT NOT NULL, value TEXT NOT NULL, reason TEXT NOT NULL, actor_id INTEGER NOT NULL REFERENCES users(id), timestamp TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS subjects (id INTEGER PRIMARY KEY, class_id INTEGER NOT NULL REFERENCES classes(id), name TEXT NOT NULL COLLATE NOCASE, UNIQUE(class_id,name));
+    CREATE TABLE IF NOT EXISTS assessments (id INTEGER PRIMARY KEY, subject_id INTEGER NOT NULL REFERENCES subjects(id), name TEXT NOT NULL COLLATE NOCASE, date TEXT NOT NULL, max_marks REAL NOT NULL CHECK(max_marks>0 AND max_marks<=10000), version INTEGER NOT NULL DEFAULT 0, UNIQUE(subject_id,name,date));
+    CREATE TABLE IF NOT EXISTS academic_marks (assessment_id INTEGER NOT NULL REFERENCES assessments(id), student_id INTEGER NOT NULL REFERENCES students(id), marks REAL NOT NULL CHECK(marks>=0), PRIMARY KEY(assessment_id,student_id));
     INSERT OR IGNORE INTO schema_migrations VALUES (1);
+    INSERT OR IGNORE INTO schema_migrations VALUES (4);
   `);
   if (!db.prepare('PRAGMA table_info(users)').all().some(c=>c.name==='active')) db.exec('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))');
   if (!db.prepare('SELECT 1 FROM schema_migrations WHERE version=3').get()) {

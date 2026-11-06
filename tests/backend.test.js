@@ -160,3 +160,67 @@ test('SQLite records and report survive a database reopen', t => {
   const before=report(db,1,'2024-04'); db.close();
   db=openDatabase(file); assert.deepEqual(report(db,1,'2024-04'),before); assert.equal(before.students[0].present,1); assert.equal(before.students[0].unmarked,6); db.close();
 });
+
+test('academic marks respect class access, dates, validation, concurrency and persistence', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'academic-marks-test-')),file=path.join(dir,'test.sqlite');
+  let db=openDatabase(file);
+  db.prepare('INSERT INTO users(username,password_hash,role) VALUES (?,?,?)').run('admin',hashPassword('test password 123'),'admin');
+  db.prepare('INSERT INTO users(username,password_hash,role) VALUES (?,?,?)').run('faculty',hashPassword('faculty password 123'),'faculty');
+  db.prepare('INSERT INTO classes(name) VALUES (?)').run('Class A');
+  db.prepare('INSERT INTO classes(name) VALUES (?)').run('Class B');
+  db.prepare('INSERT INTO assignments(user_id,class_id) VALUES (?,?)').run(2,1);
+  db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Student A','Test');
+  db.prepare('INSERT INTO students(name,department) VALUES (?,?)').run('Student B','Test');
+  db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (?,?,?,?,?)').run(1,1,'A1','2024-04-01','2024-04-30');
+  db.prepare('INSERT INTO enrollments(student_id,class_id,roll,start_date,end_date) VALUES (?,?,?,?,?)').run(2,1,'A2','2024-04-20','2024-04-30');
+  db.prepare('INSERT INTO attendance(student_id,class_id,date,period,status) VALUES (?,?,?,?,?)').run(1,1,'2024-04-01',1,'P');
+  // Simulate an existing database from before the academic schema was added.
+  db.exec('DROP TABLE academic_marks; DROP TABLE assessments; DROP TABLE subjects; DELETE FROM schema_migrations WHERE version=4');
+  db.close(); db=openDatabase(file);
+  assert.equal(db.prepare('SELECT status FROM attendance WHERE student_id=1').get().status,'P');
+  const app=createApp(db,{staticDir:false}),server=app.listen(0,'127.0.0.1');
+  await new Promise(r=>server.once('listening',r));
+  t.after(()=>{server.close();db.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${server.address().port}`;
+  function client() { let cookie='',csrf=''; return async (route,method='GET',body) => { const response=await fetch(base+route,{method,headers:{...(cookie?{cookie}:{}),...(csrf?{'X-CSRF-Token':csrf}:{}),...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{})}); const set=response.headers.get('set-cookie'); if(set) cookie=set.split(';')[0]; const data=await response.json(); if(data.csrfToken) csrf=data.csrfToken; return {status:response.status,data}; }; }
+  const faculty=client(),admin=client(),guest=client();
+  await faculty('/api/session'); await faculty('/api/login','POST',{username:'faculty',password:'faculty password 123'});
+  await admin('/api/session'); await admin('/api/login','POST',{username:'admin',password:'test password 123'});
+  assert.equal((await guest('/api/subjects?classId=1')).status,401);
+  assert.equal((await faculty('/api/subjects?classId=2')).status,403);
+  assert.equal((await faculty('/api/performance?classId=2&month=2024-04')).status,403);
+  assert.equal((await faculty('/api/subjects','POST',{classId:2,name:'No access'})).status,403);
+  const subject=(await faculty('/api/subjects','POST',{classId:1,name:'Mathematics'})).data.id;
+  assert.ok(subject);
+  assert.equal((await faculty('/api/subjects','POST',{classId:1,name:'mathematics'})).status,409);
+  assert.equal((await faculty('/api/assessments','POST',{classId:2,subjectId:subject,name:'Test',date:'2024-04-10',maxMarks:20})).status,403);
+  assert.equal((await faculty('/api/assessments','POST',{classId:1,subjectId:subject,name:'Test',date:'2024-02-30',maxMarks:20})).status,400);
+  assert.equal((await faculty('/api/assessments','POST',{classId:1,subjectId:subject,name:'Test',date:'2024-04-10',maxMarks:0})).status,400);
+  const assessment=(await faculty('/api/assessments','POST',{classId:1,subjectId:subject,name:'Test 1',date:'2024-04-10',maxMarks:20})).data.id;
+  assert.equal((await faculty(`/api/marks?classId=2&assessmentId=${assessment}`)).status,403);
+  let grid=(await faculty(`/api/marks?classId=1&assessmentId=${assessment}`)).data;
+  assert.deepEqual(grid.students.map(s=>[s.id,s.marks]),[[1,null]]);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:0,entries:[{studentId:1,marks:21}]})).status,400);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:0,entries:[{studentId:1,marks:4},{studentId:2,marks:5}]})).status,400);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:0,entries:[{studentId:1,marks:4},{studentId:1,marks:5}]})).status,400);
+  assert.equal((await faculty(`/api/marks?classId=1&assessmentId=${assessment}`)).data.students[0].marks,null);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:0,entries:[{studentId:1,marks:0}]})).status,200);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:0,entries:[{studentId:1,marks:7}]})).status,409);
+  let performance=(await faculty('/api/performance?classId=1&month=2024-04')).data;
+  assert.equal(performance.students[0].present,1);
+  assert.equal(performance.students[0].marks[0].marks,0);
+  assert.deepEqual(performance.students[1].marks,[]); // Student was not yet enrolled on the assessment date.
+  const enrollmentChange=await admin('/api/students/1','PUT',{classId:1,roll:'A1',name:'Student A',department:'Test',startDate:'2024-04-01',endDate:'2024-04-09'});
+  assert.equal(enrollmentChange.status,409); assert.match(enrollmentChange.data.error,/recorded marks/);
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:1,entries:[{studentId:1,marks:18.5}]})).status,200);
+  // A fresh database connection sees saved marks and pre-existing attendance.
+  const reopened=openDatabase(file);
+  assert.equal(reopened.prepare('SELECT marks FROM academic_marks WHERE assessment_id=? AND student_id=1').get(assessment).marks,18.5);
+  assert.equal(reopened.prepare('SELECT status FROM attendance WHERE student_id=1').get().status,'P');
+  reopened.close();
+  assert.equal((await faculty('/api/marks','PUT',{classId:1,assessmentId:assessment,version:2,entries:[{studentId:1,marks:null}]})).status,200);
+  grid=(await faculty(`/api/marks?classId=1&assessmentId=${assessment}`)).data;
+  assert.equal(grid.students[0].marks,null);
+  performance=(await faculty('/api/performance?classId=1&month=2024-04')).data;
+  assert.equal(performance.students[0].marks[0].marks,null);
+});
